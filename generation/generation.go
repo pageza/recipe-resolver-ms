@@ -1,15 +1,15 @@
-// cursor--Update generation module to support DeepSeek API for recipe generation.
-// This module encapsulates the logic to call an external LLM provider to generate a recipe
-// when no exact or close match is found in the local database. It allows switching between
-// different providers (e.g., OpenAI, DeepSeek) based on environment configuration.
+// cursor--Update generation module to log and verify the Authorization header setting for DeepSeek API calls.
+// This updated version adds debug logs to confirm that the Authorization header is correctly attached.
 package generation
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -41,9 +41,50 @@ type LLMResponse struct {
 	AlternativeRecipes []Recipe `json:"alternative_recipes"`
 }
 
+// DeepSeekMessage represents the message part of DeepSeek's chat response.
+type DeepSeekMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// DeepSeekChoice represents a choice in DeepSeek's response.
+type DeepSeekChoice struct {
+	Index        int             `json:"index"`
+	Message      DeepSeekMessage `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+// DeepSeekResponse represents the overall response structure from DeepSeek's API.
+type DeepSeekResponse struct {
+	ID      string           `json:"id"`
+	Object  string           `json:"object"`
+	Created int64            `json:"created"`
+	Choices []DeepSeekChoice `json:"choices"`
+	Usage   interface{}      `json:"usage"`
+}
+
+// HTTPClient is a package-level HTTP client which can be overridden in tests.
+var HTTPClient = &http.Client{Timeout: 90 * time.Second}
+
+// stripCodeFences removes markdown code fence markers from a string if present.
+func stripCodeFences(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		// Remove the first line containing the opening code fence.
+		if i := strings.Index(s, "\n"); i != -1 {
+			s = s[i+1:]
+		}
+		// Remove trailing code fence.
+		if i := strings.LastIndex(s, "```"); i != -1 {
+			s = s[:i]
+		}
+	}
+	return strings.TrimSpace(s)
+}
+
 // GenerateRecipe calls the configured LLM provider endpoint with a structured prompt based
 // on the user's recipe query. If the DEEPEEK_API_KEY environment variable is set, it uses DeepSeek's
-// API format. Otherwise, it falls back to a default format.
+// API format. Otherwise, it falls back to a default format. It logs the request headers for debugging.
 func GenerateRecipe(query string) (Recipe, []Recipe, error) {
 	// Retrieve the LLM endpoint URL from environment variables.
 	llmEndpoint := os.Getenv("LLM_ENDPOINT")
@@ -51,10 +92,7 @@ func GenerateRecipe(query string) (Recipe, []Recipe, error) {
 		return Recipe{}, nil, errors.New("LLM_ENDPOINT environment variable not set")
 	}
 
-	// Set up an HTTP client with a timeout.
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	// Define a structured prompt instructing the LLM to generate a recipe.
+	// Construct the prompt.
 	prompt := "Generate a recipe based on the following query: \"" + query + "\". " +
 		"Return a JSON object with two keys: 'primary_recipe' and 'alternative_recipes'. " +
 		"The 'primary_recipe' should be a JSON object representing the main recipe with keys: " +
@@ -65,15 +103,14 @@ func GenerateRecipe(query string) (Recipe, []Recipe, error) {
 	var err error
 	var req *http.Request
 
-	// Check if the DEEPEEK_API_KEY is set to determine if DeepSeek integration should be used.
-	deepSeekKey := os.Getenv("DEEPSEEK_API_KEY")
-	if deepSeekKey != "" {
-		// For DeepSeek, the API expects a payload with "model", "messages", and "stream".
+	// Check if DEEPEEK_API_KEY is provided to use DeepSeek API.
+	deepseekKey := os.Getenv("DEEPSEEK_API_KEY")
+	if deepseekKey != "" {
+		// Use DeepSeek's expected payload format.
 		model := os.Getenv("DEEPSEEK_MODEL")
 		if model == "" {
 			model = "deepseek-chat"
 		}
-		// Construct the messages payload.
 		payload := struct {
 			Model    string              `json:"model"`
 			Messages []map[string]string `json:"messages"`
@@ -90,15 +127,16 @@ func GenerateRecipe(query string) (Recipe, []Recipe, error) {
 		if err != nil {
 			return Recipe{}, nil, err
 		}
-		// Create the HTTP request for the DeepSeek API.
 		req, err = http.NewRequest(http.MethodPost, llmEndpoint, bytes.NewReader(reqBody))
 		if err != nil {
 			return Recipe{}, nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+deepSeekKey)
+		req.Header.Set("Authorization", "Bearer "+deepseekKey)
+		// Debug log to verify headers are set.
+		log.Printf("DeepSeek Request Headers: %+v", req.Header)
 	} else {
-		// Fallback: use the default API call structure with a simple prompt.
+		// Default API call structure.
 		reqPayload := llmRequest{
 			Prompt: prompt,
 		}
@@ -113,24 +151,45 @@ func GenerateRecipe(query string) (Recipe, []Recipe, error) {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	// Send the HTTP request.
-	resp, err := client.Do(req)
+	start := time.Now()
+	resp, err := HTTPClient.Do(req)
+	elapsed := time.Since(start)
+	log.Printf("DeepSeek API call took %v", elapsed)
+
 	if err != nil {
 		return Recipe{}, nil, err
 	}
 	defer resp.Body.Close()
 
-	// Check the response status.
+	// Check if response status is 200 OK.
 	if resp.StatusCode != http.StatusOK {
 		return Recipe{}, nil, errors.New("LLM endpoint returned non-200 status: " + resp.Status)
 	}
 
-	// Decode the JSON response.
-	var llmResp LLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return Recipe{}, nil, err
-	}
+	// If using DeepSeek, its response is nested inside a "choices" array.
+	if deepseekKey != "" {
+		var dsResp DeepSeekResponse
+		if err := json.NewDecoder(resp.Body).Decode(&dsResp); err != nil {
+			return Recipe{}, nil, err
+		}
+		if len(dsResp.Choices) == 0 {
+			return Recipe{}, nil, errors.New("no choices in DeepSeek response")
+		}
+		content := dsResp.Choices[0].Message.Content
+		cleanContent := stripCodeFences(content)
+		log.Printf("Extracted content: %s", cleanContent)
 
-	// Return the primary recipe and alternative recipes.
-	return llmResp.PrimaryRecipe, llmResp.AlternativeRecipes, nil
+		var llmResp LLMResponse
+		if err := json.Unmarshal([]byte(cleanContent), &llmResp); err != nil {
+			return Recipe{}, nil, err
+		}
+		return llmResp.PrimaryRecipe, llmResp.AlternativeRecipes, nil
+	} else {
+		// Decode the response.
+		var llmResp LLMResponse
+		if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
+			return Recipe{}, nil, err
+		}
+		return llmResp.PrimaryRecipe, llmResp.AlternativeRecipes, nil
+	}
 }

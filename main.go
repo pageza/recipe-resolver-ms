@@ -5,10 +5,10 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
+	"github.com/pageza/recipe-resolver-ms/generation"
 	"github.com/pageza/recipe-resolver-ms/nlp"
 
 	"github.com/google/uuid"
@@ -66,6 +66,30 @@ var recipesDB = []Recipe{
 	),
 }
 
+// cursor--Update resolveRecipe to convert generation.Recipe to local Recipe type.
+
+func convertGenRecipe(r generation.Recipe) Recipe {
+	return Recipe{
+		ID:                r.ID,
+		Title:             r.Title,
+		Ingredients:       r.Ingredients,
+		Steps:             r.Steps,
+		NutritionalInfo:   r.NutritionalInfo,
+		AllergyDisclaimer: r.AllergyDisclaimer,
+		Appliances:        r.Appliances,
+		CreatedAt:         r.CreatedAt,
+		UpdatedAt:         r.UpdatedAt,
+	}
+}
+
+func convertGenRecipes(rs []generation.Recipe) []Recipe {
+	recipes := make([]Recipe, len(rs))
+	for i, r := range rs {
+		recipes[i] = convertGenRecipe(r)
+	}
+	return recipes
+}
+
 // resolveRecipe processes the incoming query and determines the best matching recipe.
 // The function follows three logical steps:
 //
@@ -90,49 +114,38 @@ var recipesDB = []Recipe{
 //   - The new recipe uses the query as its title and all other fields are initialized as empty or default.
 //   - In this case, alternative recipes remain empty.
 func resolveRecipe(query string) (Recipe, []Recipe) {
-	// Define a local structure to hold each potential match along with its similarity score.
-	type match struct {
-		recipe     Recipe
-		similarity float64
-	}
-	var matches []match
-
-	// The threshold determines the minimum similarity score required for considering a recipe a match.
-	threshold := 0.3
-
-	// Iterate over all recipes in the database and calculate the similarity between the query and each recipe title.
-	for _, recipe := range recipesDB {
-		// Utilize the JaccardSimilarity function from the nlp module.
-		similarity := nlp.JaccardSimilarity(query, recipe.Title)
-		// If similarity meets or exceeds the threshold, include this recipe as a potential match.
-		if similarity >= threshold {
-			matches = append(matches, match{recipe: recipe, similarity: similarity})
+	// Exact match check.
+	for _, r := range recipesDB {
+		if strings.EqualFold(r.Title, query) {
+			return r, nil
 		}
 	}
 
-	// If no recipes meet the threshold, generate a new Recipe using the query as its title.
-	if len(matches) == 0 {
+	// Find the best closest match based on Jaccard similarity.
+	bestSim := 0.0
+	var best Recipe
+	for _, r := range recipesDB {
+		sim := nlp.JaccardSimilarity(query, r.Title)
+		if sim > bestSim {
+			bestSim = sim
+			best = r
+		}
+	}
+
+	similarityThreshold := 0.3
+	if bestSim >= similarityThreshold {
+		// Mark the recipe as a close match.
+		best.Title = best.Title + " (Close Match)"
+		return best, nil
+	}
+
+	// No close match found, fallback to LLM generation.
+	generated, alternatives, err := generation.GenerateRecipe(query)
+	if err != nil {
+		// Fallback: Return a new recipe with the query as its title.
 		return newRecipe(query, []string{}, []string{}, map[string]int{}, "", []string{}), nil
 	}
-
-	// Sort the collected matches in descending order based on their similarity scores.
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i].similarity > matches[j].similarity
-	})
-
-	// Select the best matching recipe as the primary match.
-	primary := matches[0].recipe
-	// Append a " (Close Match)" marker if the best match isn't a perfect (exact) match.
-	if matches[0].similarity < 1.0 {
-		primary.Title = primary.Title + " (Close Match)"
-	}
-
-	// Any additional matches are gathered as alternative recipe suggestions.
-	var alternatives []Recipe
-	for i := 1; i < len(matches); i++ {
-		alternatives = append(alternatives, matches[i].recipe)
-	}
-	return primary, alternatives
+	return convertGenRecipe(generated), convertGenRecipes(alternatives)
 }
 
 // ResolveRequest defines the structure for the incoming JSON payload.
