@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/pageza/recipe-resolver-ms/generation"
 	"github.com/pageza/recipe-resolver-ms/nlp"
 
@@ -24,14 +25,14 @@ type Recipe struct {
 	NutritionalInfo   interface{} `json:"nutritional_info"`
 	AllergyDisclaimer string      `json:"allergy_disclaimer"`
 	Appliances        []string    `json:"appliances"`
-	CreatedAt         string      `json:"created_at"`
-	UpdatedAt         string      `json:"updated_at"`
+	CreatedAt         time.Time   `json:"created_at"`
+	UpdatedAt         time.Time   `json:"updated_at"`
 }
 
 // newRecipe creates a new Recipe object with the provided details.
 // It sets a unique ID (via uuid) and the current UTC timestamps for both creation and update.
 func newRecipe(title string, ingredients, steps []string, nutritionalInfo interface{}, allergyDisclaimer string, appliances []string) Recipe {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC()
 	return Recipe{
 		ID:                uuid.New().String(),
 		Title:             title,
@@ -69,6 +70,15 @@ var recipesDB = []Recipe{
 // cursor--Update resolveRecipe to convert generation.Recipe to local Recipe type.
 
 func convertGenRecipe(r generation.Recipe) Recipe {
+	createdAt, err := time.Parse(time.RFC3339, r.CreatedAt)
+	if err != nil {
+		createdAt, _ = time.Parse("2006-01-02", r.CreatedAt)
+	}
+	updatedAt, err := time.Parse(time.RFC3339, r.UpdatedAt)
+	if err != nil {
+		updatedAt, _ = time.Parse("2006-01-02", r.UpdatedAt)
+	}
+
 	return Recipe{
 		ID:                r.ID,
 		Title:             r.Title,
@@ -77,8 +87,8 @@ func convertGenRecipe(r generation.Recipe) Recipe {
 		NutritionalInfo:   r.NutritionalInfo,
 		AllergyDisclaimer: r.AllergyDisclaimer,
 		Appliances:        r.Appliances,
-		CreatedAt:         r.CreatedAt,
-		UpdatedAt:         r.UpdatedAt,
+		CreatedAt:         createdAt,
+		UpdatedAt:         updatedAt,
 	}
 }
 
@@ -114,37 +124,45 @@ func convertGenRecipes(rs []generation.Recipe) []Recipe {
 //   - The new recipe uses the query as its title and all other fields are initialized as empty or default.
 //   - In this case, alternative recipes remain empty.
 func resolveRecipe(query string) (Recipe, []Recipe) {
+	log.Printf("Resolver: Starting resolution for query: %q", query)
+
 	// Exact match check.
 	for _, r := range recipesDB {
 		if strings.EqualFold(r.Title, query) {
+			log.Printf("Resolver: Exact match found for recipe: %+v", r)
 			return r, nil
 		}
 	}
+	log.Println("Resolver: No exact match found; proceeding with Jaccard similarity search")
 
-	// Find the best closest match based on Jaccard similarity.
 	bestSim := 0.0
 	var best Recipe
 	for _, r := range recipesDB {
 		sim := nlp.JaccardSimilarity(query, r.Title)
+		log.Printf("Resolver: Compared recipe %q with similarity %f", r.Title, sim)
 		if sim > bestSim {
 			bestSim = sim
 			best = r
 		}
 	}
+	log.Printf("Resolver: Best similarity found: %f for recipe: %+v", bestSim, best)
 
 	similarityThreshold := 0.3
 	if bestSim >= similarityThreshold {
-		// Mark the recipe as a close match.
 		best.Title = best.Title + " (Close Match)"
+		log.Printf("Resolver: Close match meets threshold; returning modified recipe: %+v", best)
 		return best, nil
 	}
 
-	// No close match found, fallback to LLM generation.
+	log.Println("Resolver: No close match found; invoking LLM generation via GenerateRecipe")
 	generated, alternatives, err := generation.GenerateRecipe(query)
 	if err != nil {
-		// Fallback: Return a new recipe with the query as its title.
-		return newRecipe(query, []string{}, []string{}, map[string]int{}, "", []string{}), nil
+		log.Printf("Resolver: GenerateRecipe returned error: %v", err)
+		fallback := newRecipe(query, []string{}, []string{}, map[string]int{}, "", []string{})
+		log.Printf("Resolver: Returning fallback recipe: %+v", fallback)
+		return fallback, nil
 	}
+	log.Printf("Resolver: GenerateRecipe successful; primary recipe: %+v, alternative recipes: %+v", generated, alternatives)
 	return convertGenRecipe(generated), convertGenRecipes(alternatives)
 }
 
@@ -202,6 +220,29 @@ func resolveHandler(w http.ResponseWriter, r *http.Request) {
 // main initializes the HTTP server, registers the /resolve endpoint handler,
 // and starts listening on the port specified by the PORT environment variable (defaults to 3000 if not set).
 func main() {
+	// Load environment variables from .env file.
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("No .env file found or error loading .env:", err)
+	} else {
+		log.Println(".env file loaded successfully")
+	}
+
+	// Check and log important environment variables.
+	llmEndpoint := os.Getenv("LLM_ENDPOINT")
+	if llmEndpoint == "" {
+		log.Println("LLM_ENDPOINT is not set!")
+	} else {
+		log.Println("LLM_ENDPOINT:", llmEndpoint)
+	}
+
+	deepSeekKey := os.Getenv("DEEPSEEK_API_KEY")
+	if deepSeekKey == "" {
+		log.Println("DEEPSEEK_API_KEY is not set!")
+	} else {
+		log.Println("DEEPSEEK_API_KEY loaded.")
+	}
+
 	http.HandleFunc("/resolve", resolveHandler)
 	port := os.Getenv("PORT")
 	if port == "" {
